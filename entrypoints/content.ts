@@ -1,9 +1,10 @@
 /**
- * Rewrites one line in Google Flow's main JS bundle before the page runs it.
+ * Rewrites Google Flow's route guards in its main JS bundle before the page
+ * runs it, so the app stops redirecting to its "you can't use this" pages.
  *
  * The bundle is a parser-inserted <script id="base-js"> at the end of <body>.
  * We catch the element at document_start, cancel it, re-fetch the source
- * (gstatic allows CORS from flow.google.com), apply the patch, and run the
+ * (gstatic allows CORS from flow.google.com), apply the patches, and run the
  * result in its place. The fetch is synchronous on purpose: it keeps the
  * bundle's original timing, so it still executes before DOMContentLoaded.
  */
@@ -17,19 +18,47 @@ const APP_BUNDLE =
 /** Only the entry chunk; lazy chunks use other `m=` values and must be left alone. */
 const MAIN_CHUNK = /\/m=_b$/;
 
-/** Set by the bundle itself on its first line — our "has it already run?" sentinel. */
+/** Set by the bundle itself on its first line - our "has it already run?" sentinel. */
 const APP_GLOBAL = 'default_AiSandboxAngularFrontend';
 
 /**
- * Tried in order; the first one that matches exactly once wins.
- *  1. the literal line
- *  2. same line, anchored on the "/unsupported-country" route instead of the
- *     minified names, so a rename of `l.Pa` on the next deploy still patches
+ * All three redirects live in one router guard. Each entry must match exactly
+ * once or it is skipped, and each is anchored on the route string rather than
+ * on the minified identifiers around it, which Google's minifier renames on
+ * most deploys (`l.Pa` became `r.Pa` within three days).
+ *
+ * The `\s*` between every token is not cosmetic: the minifier wraps lines at
+ * roughly 580 characters, at whichever token boundary it happens to reach, and
+ * one build put a newline inside a call of exactly this shape -
+ * `return new Iq(_.UG(f,\n"/age-restricted"))`. Without them, a wrap landing in
+ * a matched span would silently cost us that bypass.
+ *
+ * The guard's own contract is: return `true` to let the navigation through, or
+ * return a redirect object to send the user somewhere else.
  */
-const PATCHES: Array<{ find: string | RegExp; replace: string }> = [
-  { find: 'if(!l.Pa())', replace: 'if(false)' },
+const PATCHES: Array<{ name: string; find: RegExp; replace: string }> = [
   {
-    find: /if\(![\w$]+\.[\w$]+\(\)\)(?=return new [\w$]+\(_\.[\w$]+\([\w$]+,"\/unsupported-country"\))/,
+    // if(!r.Pa())return new oq(_.hF(g,"/unsupported-country"))  ->  if(false)...
+    name: 'unsupported-country',
+    find: /if\(\s*!\s*[\w$]+\s*\.\s*[\w$]+\s*\(\s*\)\s*\)\s*(?=return\s+new\s+[\w$]+\(\s*_\s*\.\s*[\w$]+\(\s*[\w$]+\s*,\s*"\/unsupported-country"\s*\))/,
+    replace: 'if(false)',
+  },
+  {
+    // case 4:case 5:case 6:case 8:return new oq(_.hF(g,"/unavailable"))
+    //                          -> case 4:case 5:case 6:case 8:return!0
+    // The whole return goes, rather than a condition, because this one is a
+    // switch case. `return!0` is the guard's "allow" value and stays valid
+    // wherever the original return was - `break` would not.
+    name: 'unavailable',
+    find: /return\s+new\s+[\w$]+\(\s*_\s*\.\s*[\w$]+\(\s*[\w$]+\s*,\s*"\/unavailable"\s*\)\s*\)/,
+    replace: 'return!0',
+  },
+  {
+    // if(_.Ls(h))return new oq(g.ma(["/unsupported-browser"],...))  ->  if(false)...
+    // `h` is navigator.userAgent. Neutralising the test, instead of returning
+    // early, leaves the rest of the guard running as usual.
+    name: 'unsupported-browser',
+    find: /if\(\s*(?:_\s*\.\s*)?[\w$]+\(\s*[\w$]+\s*\)\s*\)\s*(?=return\s+new\s+[\w$]+\(\s*[\w$]+\s*\.\s*[\w$]+\(\s*\[\s*"\/unsupported-browser"\s*\])/,
     replace: 'if(false)',
   },
 ];
@@ -82,7 +111,13 @@ function patchBundle(original: HTMLScriptElement) {
   // Synchronous: nothing else can run on this thread until it returns, so the
   // original script cannot slip through while we are fetching.
   const source = fetchSync(url);
-  const code = applyPatch(source, url);
+  const { code, applied, missed } = applyPatches(source);
+
+  // Nothing to gain from swapping in an identical bundle, so don't take the risk.
+  if (applied.length === 0) {
+    console.warn(TAG, 'no pattern matched, leaving the page alone:', url);
+    return;
+  }
 
   // Build both elements before touching the DOM. Anything that throws in here
   // (Trusted Types, mainly) then leaves the original in place, and the page
@@ -96,21 +131,30 @@ function patchBundle(original: HTMLScriptElement) {
   original.remove(); // cancels the pending parser-blocking execution
   parent.insertBefore(twin, next); // stand-in #base-js for lazy-chunk URLs
   parent.insertBefore(patched, next);
-  console.info(TAG, 'patched', url);
+
+  console.info(TAG, 'bypassed:', applied.join(', '));
+  if (missed.length) console.warn(TAG, 'patterns that need updating:', missed.join(', '), url);
 }
 
-function applyPatch(source: string, url: string): string {
-  for (const { find, replace } of PATCHES) {
-    const hits = countMatches(source, find);
-    if (hits === 1) return source.replace(find, replace);
-    if (hits > 1) console.warn(TAG, String(find), `matched ${hits}x, skipping it`);
+function applyPatches(source: string) {
+  const applied: string[] = [];
+  const missed: string[] = [];
+  let code = source;
+
+  for (const { name, find, replace } of PATCHES) {
+    const hits = countMatches(code, find);
+    if (hits === 1) {
+      code = code.replace(find, replace);
+      applied.push(name);
+    } else {
+      missed.push(`${name} (${hits} matches)`);
+    }
   }
-  console.warn(TAG, 'no pattern matched, running the bundle unchanged:', url);
-  return source;
+
+  return { code, applied, missed };
 }
 
-function countMatches(source: string, find: string | RegExp): number {
-  if (typeof find === 'string') return source.split(find).length - 1;
+function countMatches(source: string, find: RegExp): number {
   const global = new RegExp(find.source, find.flags.includes('g') ? find.flags : `${find.flags}g`);
   return (source.match(global) ?? []).length;
 }

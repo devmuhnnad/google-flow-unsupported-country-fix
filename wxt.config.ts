@@ -6,7 +6,7 @@ export default defineConfig({
   manifestVersion: 3,
   manifest: {
     name: 'Google Flow Fix',
-    description: 'Skips the unsupported-country route guard in Google Flow.',
+    description: "Skips Google Flow's unsupported-country, unavailable and unsupported-browser redirects.",
     // No permissions needed: the content script's own match grants page access,
     // and the bundle is re-fetched from the page's origin (gstatic sends
     // Access-Control-Allow-Origin: https://flow.google.com).
